@@ -1,3 +1,4 @@
+import traceback
 import argparse, os, sys, subprocess, re, time, random, string, shutil
 from Queue import Queue
 from threading import Thread
@@ -9,6 +10,9 @@ parser.add_argument('outdir', help='Directory to output to on the cluster')
 parser.add_argument('indir', help='The local directory to store completed jobs in')
 parser.add_argument('-p', '--placeholder', default='?', help='The character used to indicate a file within a command. Default is "?"')
 parser.add_argument('-qs', '--queue_size', type=int, default=20, help='The number of commands to be running concurrently. Default is 20.')
+parser.add_argument('-ncpus', type=int, default=12, help='The number of CPUs to use per job (max 12). Default = 1.')
+parser.add_argument('-mem', default='3.83G', help='The memory to use per job. Default is "3.83G".')
+parser.add_argument('-fn', '--filename', action='store_true', help='If your command requires a filename rather than an output directory, enable this flag.')
 #parser.add_argument()
 #parser.add_argument()
 #parser.add_argument()
@@ -42,7 +46,7 @@ def parseConfig(config):
     return commands
 
 # Create the actual string for the command
-def createCommand(command, remote_path, placeholder):
+def createCommand(command, remote_path, placeholder, fname=False):
 
     # Output directory
     remote_path = os.path.join(remote_path,command.name)
@@ -58,6 +62,8 @@ def createCommand(command, remote_path, placeholder):
         remote = os.path.join(remote_path, os.path.basename(f))
         result[pos] = remote
 
+    if fname:
+        remote_path = os.path.join(remote_path, command.name + '_')
     # Try to replace the output if specified
     try:
         x = result.index('<output>')
@@ -97,45 +103,44 @@ def waitJob(jid, cluster='genesis'):
 def transfer(_file, dest):
     command = 'ssh apollo qsub /home/dmacmillan/scripts/bash/transfer_file.sh {} {}'.format(_file, dest)
     c = subprocess.Popen(command.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    sprint('Transferring {} -> {}...'.format(_file, dest))
     o,e = c.communicate()
-    print 'DONE'
-    jid = o.split()[2]
+#    print 'DONE'
+    try:
+        jid = o.split()[2]
+    except Exception as e:
+        print 'command: "{}"\no: "{}"\ne: "{}"'.format(command,o,e)
+    print '({}) Transferring {} -> {}...'.format(jid, _file, dest)
     return command, jid, o, e
 
-def generateQsub(command, mem='3.83G', ncpus=12, queue='all.q', stdout=None, stderr=None):
+def generateQsub(command, exclusive=True, mem='3.83G', ncpus=12, queue='all.q', stdout=None, stderr=None):
     s = '#!/bin/bash\n'
     s += '#$ -S /bin/bash\n'
     s += '#$ -q {}\n'.format(queue)
     s += '#$ -pe ncpus {}\n'.format(ncpus)
-    s += '#$ -l excl=true,mem_free={},mem_token={},h_vmem={}\n'.format(mem,mem,mem)
-    s += '#$ -j y\n'
+    s += '#$ -l'
+    if exclusive:
+        s += ' excl=true,'
+    else:
+        s += ' '
+    s += 'mem_free={},mem_token={},h_vmem={}\n'.format(mem,mem,mem)
+    if stdout:
+        s += '#$ -o {}\n'.format(stdout)
+    if stderr:
+        s += '#$ -e {}\n'.format(stderr)
     s += '#$ -V\n\n'
     s += command
-    if stdout:
-        s += ' > {}'.format(stdout)
-    if stderr:
-        s += ' 2> {}'.format(stderr)
     return s,stdout,stderr
 
-def run(command, gen_path, indir):
+def run(command, gen_path, indir, myncpus=1, mymem='3.83G', myfname=False):
 
-    # Create a random name for the job
-    #job_name = ''.join(random.choice(string.ascii_lowercase +  string.digits) for _ in range(20))
-
-    # Genesis directory to run job in
-    #gen_path = os.path.join(gen_path, job_name)
-
-    formatted_command = createCommand(command, gen_path, args.placeholder)
-    #print formatted_command
-    #sys.exit()
+    formatted_command = createCommand(command, gen_path, args.placeholder, fname=myfname)
 
     # Genesis directory to run job in
     gen_path = os.path.join(gen_path, command.name)
 
     # Create the directory on genesis
     if not os.path.exists(gen_path):
-        sprint('Creating genesis directory {}...'.format(gen_path))
+        print 'Creating genesis directory {}...'.format(gen_path)
         os.mkdir(gen_path)
         # Transfer all necessary files to gen_path on genesis
         transfers = []
@@ -144,30 +149,14 @@ def run(command, gen_path, indir):
             transfers.append([c,jid])
         for i in transfers:
             waitJob(i[1], cluster='apollo')
-        print 'DONE'
-
-    # Record this name in a logfile for future reference
-    #logfile.write('{}\t{}\n'.format(job_name, ' '.join(command[0])))
-    #logfile.flush()
-
-
-    # Alter the command to include the correct genesis paths
-#    i = 1
-#    while True:
-#        try:
-#            x = command[0].index('?')
-#            command[0][x] = os.path.join(gen_path, os.path.basename(command[i]))
-#            i += 1
-#        except ValueError:
-#            break
+#        print 'DONE'
 
     submit_path = os.path.join(gen_path, 'submit')
 
     # Generate qsub command
-    qsub,o,e = generateQsub((' ').join(formatted_command), ncpus=1)
+    qsub,o,e = generateQsub((' ').join(formatted_command), ncpus=myncpus, mem=mymem, stdout=os.path.join(gen_path,'{}.o'.format(command.name)), stderr=os.path.join(gen_path,'{}.e'.format(command.name)))
 
     # Write the command to genesis
-    #subprocess.call('ssh genesis echo \'{}\' > {}'.format((' ').join(command[0]), submit_path).split())
     with open(submit_path, 'w') as f:
         f.write(qsub)
     #subprocess.call('ssh genesis echo -e \'{}\' > {}'.format(qsub, submit_path).split())
@@ -177,24 +166,33 @@ def run(command, gen_path, indir):
     submit = 'ssh genesis qsub {}'.format(submit_path).split()
 
     # Submit job on genesis
-    sprint('Submitting job to Genesis...')
     jid,o,e = submitJob(submit)
-    print 'DONE'
-    print 'job_id: {}'.format(jid)
+    print 'Submitting job ({}) to Genesis...'.format(jid)
+#    print 'DONE'
+#    print 'job_id: {}'.format(jid)
 
+    time.sleep(3)
     # Wait for the job to finish
-    sprint('Waiting for job to finish...')
+    print 'Waiting for job to finish...'
     waitJob(jid)
-    print 'DONE'
+
+    # Remove temporary files before transferring back
+    for i in command.files:
+        gen_file = os.path.join(gen_path, os.path.basename(i))
+        try:
+            os.remove(gen_file)
+        except OSError:
+            print 'Warning: Files are missing from this path? {}'.format(gen_path)
 
     # Transfer the completed job back to filer
     c,tid,o,e = transfer(gen_path, args.indir)
     waitJob(tid, cluster='apollo')
 
     # Clean genesis directory
-    sprint('Removing leftover files...')
+    #print 'Keeping temporary files for debugging, uncomment line 197 to remove'
+    print 'Removing leftover files...'
     shutil.rmtree(gen_path)
-    print 'DONE'
+#    print 'DONE'
 
 # Parse the commands
 #parsed = parseCommands(args.commands)
@@ -212,4 +210,28 @@ q = Queue()
 #logfile = open('./handler.log', 'w')
 #logfile.write('{}\t{}\n'.format('job_name', 'command'))
 
-run(parsed[0], '/genesis/extscratch/btl/dmacmillan/transfers', args.indir)
+themem = args.mem
+thencpus = args.ncpus
+thefname = args.filename
+
+def worker(q, outdir, indir):
+    for args in iter(q.get, None):
+        try:
+            run(args, outdir, indir, myncpus=thencpus, mymem=themem, myfname=thefname)
+        except Exception as e:
+            print traceback.format_exc()
+        finally:
+            q.task_done()
+
+for com in parsed:
+    q.put(com)
+
+for i in range(args.queue_size):
+    t = Thread(target = worker, args = (q, args.outdir, args.indir ))
+    t.setDaemon(True)
+    t.start()
+    time.sleep(3)
+
+q.join()
+
+#run(parsed[0], '/genesis/extscratch/btl/dmacmillan/transfers', args.indir)
